@@ -84,6 +84,29 @@ def probe(src, headers=None):
     return json.loads(r.stdout)
 
 
+def _vs(info):
+    return next((s for s in info['streams'] if s.get('codec_type') == 'video' and not s.get('disposition', {}).get('attached_pic')), None)
+
+
+def _num(x, d=0.0):
+    try: return float(x)
+    except (TypeError, ValueError): return d
+
+
+def ref_dur(info):
+    """Video stream ki asli length. Container (format) duration me audio ka late-start offset jud jaata hai (galat lamba)."""
+    v = _vs(info)
+    d = _num(v.get('duration')) if v else 0.0
+    return d if d > 0 else _num(info['format'].get('duration'))
+
+
+def audio_offset(info):
+    """Audio video se kitne second baad shuru hota hai (bada = timestamp kharab)."""
+    v = _vs(info); a = next((s for s in info['streams'] if s.get('codec_type') == 'audio'), None)
+    if not v or not a: return 0.0
+    return _num(a.get('start_time')) - _num(v.get('start_time'))
+
+
 def make_plan(info, brand, moov_first):
     vs = [s for s in info['streams'] if s.get('codec_type') == 'video' and not s.get('disposition', {}).get('attached_pic')]
     as_ = [s for s in info['streams'] if s.get('codec_type') == 'audio']
@@ -104,38 +127,73 @@ def make_plan(info, brand, moov_first):
     return 'transcode', desc
 
 
-def build_cmd(src, dst, plan, vinfo_w):
-    c = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-fflags', '+genpts', '-i', src, '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
-         '-map_metadata', '-1']
+def build_cmd(src, dst, plan, vinfo_w, off=0.0, safe=False):
+    c = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-nostdin', '-fflags', '+genpts', '-i', src]
+    shift = abs(off) > 2.0   # audio ka timestamp bahut aage/peeche = audio ko video ke saath align karo (silence ka pahaad nahi bharna)
+    if shift: c += ['-itsoffset', '%.3f' % (-off), '-fflags', '+genpts', '-i', src, '-map', '0:v:0', '-map', '1:a:0?']
+    else: c += ['-map', '0:v:0', '-map', '0:a:0?']
+    c += ['-sn', '-dn', '-map_metadata', '-1']
+    af = [] if safe else ['-af', 'aresample=async=1:first_pts=0']   # safe mode: koi audio filter nahi
     if plan == 'remux':
         c += ['-c', 'copy', '-tag:v', 'avc1']
     elif plan == 'audio':
-        c += ['-c:v', 'copy', '-tag:v', 'avc1', '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-af', 'aresample=async=1:first_pts=0']
+        c += ['-c:v', 'copy', '-tag:v', 'avc1', '-c:a', 'aac', '-b:a', '128k', '-ac', '2'] + af
     else:
         c += ['-c:v', 'libx264', '-preset', os.environ.get('PRX_PRESET', 'ultrafast'), '-crf', os.environ.get('PRX_CRF', '18'), '-pix_fmt', 'yuv420p', '-profile:v', 'high',
-              '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-af', 'aresample=async=1:first_pts=0']
+              '-c:a', 'aac', '-b:a', '192k', '-ac', '2'] + af
         mw = int(os.environ.get('PRX_MAX_W', '0') or 0)   # 0 = resolution bilkul wahi (koi chhota nahi)
         if mw and vinfo_w and vinfo_w > mw:
             c += ['-vf', "scale='min(%d,iw)':-2" % mw]
+    if safe: c += ['-avoid_negative_ts', 'make_zero']
     c += ['-max_muxing_queue_size', '4096', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', dst]
     return c
 
 
-def convert(src, dst, plan, info, headers=None):
-    dur = float(info['format'].get('duration') or 0)
+def convert(src, dst, plan, info, headers=None, safe=False):
+    import threading
+    dur = ref_dur(info)
     vw = next((s.get('width') for s in info['streams'] if s.get('codec_type') == 'video'), 0)
-    cmd = build_cmd(src, dst, plan, vw)
+    off = audio_offset(info)
+    if abs(off) > 2.0: print('      note: audio video se %.0fs aage/peeche shuru hota hai -> align kar raha hu' % off, flush=True)
+    cmd = build_cmd(src, dst, plan, vw, off, safe)
     if headers:  # http source with auth header
         cmd[cmd.index('-i'):cmd.index('-i')] = ['-headers', headers]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    last = -10
+    ef = tempfile.TemporaryFile()   # stderr file me (PIPE me bhar ke ffmpeg ruk jaata tha = "0% par atka")
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, stdin=subprocess.DEVNULL, text=True)
+    now = time.time()
+    st = {'adv': now, 'ms': -1, 'why': '', 'speed': '?'}   # adv = progress AAGE badhne ka last time (sirf line aana kaafi nahi)
+    stall = float(os.environ.get('PRX_STALL_MIN', '6')) * 60       # shuru ho jaane ke baad itni der progress na badhe = atak gaya
+    start_wait = float(os.environ.get('PRX_START_MIN', '10')) * 60  # shuru ka intezaar (badi file kholne me time lagta hai)
+    t0 = now
+
+    def watch():
+        beat = time.time()
+        while p.poll() is None:
+            time.sleep(5)
+            lim = stall if st['ms'] > 0 else start_wait
+            idle = time.time() - st['adv']
+            if idle > lim:
+                st['why'] = 'ffmpeg %.0f min se aage nahi badha (atak gaya), band kiya' % (idle / 60); p.kill(); return
+            if time.time() - beat > 120 and idle > 100:
+                beat = time.time(); print('      ... ffmpeg chal raha hai par progress ruka hai (%.0f min)' % (idle / 60), flush=True)
+    threading.Thread(target=watch, daemon=True).start()
+    last, tp = -10, time.time()
     for line in p.stdout:
-        if line.startswith('out_time_ms=') and dur:
-            try: pct = int(line.split('=')[1]) / 1e6 / dur * 100
-            except ValueError: continue
-            if pct - last >= 10 and pct <= 100:
-                last = pct; print('      ... %d%%' % min(99, pct), flush=True)
-    err = p.stderr.read(); p.wait()
+        line = line.strip()
+        if line.startswith('speed='): st['speed'] = line.split('=', 1)[1]; continue
+        if not line.startswith('out_time_ms='): continue
+        try: ms = int(line.split('=')[1])
+        except ValueError: continue
+        if ms > st['ms']: st['ms'] = ms; st['adv'] = time.time()
+        sec = ms / 1e6
+        if dur and sec > dur * 1.1 + 60:   # output source se bahut lamba = silence/timestamp bug, ruko
+            st['why'] = 'output source (%.0fs) se bahut lamba ho raha hai (%.0fs) - timestamp problem, band kiya' % (dur, sec); p.kill(); break
+        pct = sec / dur * 100 if dur else 0
+        if (pct - last >= 5 or time.time() - tp > 60) and pct <= 100:
+            last, tp = pct, time.time()
+            print('      ... %.0f%%  speed %s  (%.0f min)' % (min(99, max(0, pct)), st['speed'], (time.time() - t0) / 60), flush=True)
+    p.wait(); ef.seek(0); err = ef.read().decode('utf8', 'ignore'); ef.close()
+    if st['why']: raise RuntimeError(st['why'])
     if p.returncode != 0:
         raise RuntimeError('ffmpeg fail: ' + err.strip()[-300:])
 
@@ -172,7 +230,7 @@ def verify(dst, info_in, src=None):
     info = probe(dst)
     brand, mf, _ = mp4_layout(local_reader(dst))
     plan, desc = make_plan(info, brand, mf)
-    d_in, d_out = float(info_in['format'].get('duration') or 0), float(info['format'].get('duration') or 0)
+    d_in, d_out = ref_dur(info_in), _num(info['format'].get('duration'))
     if plan != 'skip':
         raise RuntimeError('output verify fail (%s: %s)' % (plan, desc))
     if d_in and d_out < d_in - max(3.0, d_in * 0.01):   # chhota = content kata. (lamba ho sakta hai: joda hua .ts ka probe adhoora padhta hai)
@@ -262,26 +320,34 @@ class Drive:
             return r.content if r.status_code in (200, 206) else b''
         return read
 
-    def download(self, fid, path):
+    def _dl(self, req, path):
         from googleapiclient.http import MediaIoBaseDownload
+        t0, last = time.time(), -1
         with open(path, 'wb') as fh:
-            d = MediaIoBaseDownload(fh, self.svc.files().get_media(fileId=fid, supportsAllDrives=True), chunksize=128 * 1024 * 1024)
+            d = MediaIoBaseDownload(fh, req, chunksize=64 * 1024 * 1024)
             done = False
-            while not done: _, done = d.next_chunk(num_retries=5)
+            while not done:
+                stt, done = d.next_chunk(num_retries=5)
+                if stt and int(stt.progress() * 100) // 20 != last:
+                    last = int(stt.progress() * 100) // 20
+                    print('      download %d%% (%.0f MB, %.0fs)' % (int(stt.progress() * 100), os.path.getsize(path) / 1048576, time.time() - t0), flush=True)
+
+    def download(self, fid, path):
+        self._dl(self.svc.files().get_media(fileId=fid, supportsAllDrives=True), path)
 
     def revisions(self, fid):
         return self.svc.revisions().list(fileId=fid, fields='revisions(id,modifiedTime,size)').execute().get('revisions', [])
 
     def download_rev(self, fid, rid, path):
-        from googleapiclient.http import MediaIoBaseDownload
-        with open(path, 'wb') as fh:
-            d = MediaIoBaseDownload(fh, self.svc.revisions().get_media(fileId=fid, revisionId=rid), chunksize=128 * 1024 * 1024)
-            done = False
-            while not done: _, done = d.next_chunk(num_retries=5)
+        self._dl(self.svc.revisions().get_media(fileId=fid, revisionId=rid), path)
 
     def keep(self, fid, rid):
         try: self.svc.revisions().update(fileId=fid, revisionId=rid, body={'keepForever': True}).execute()
         except Exception as e: print('   warning: keepForever nahi hua:', str(e)[:100])
+
+    def mark_ok(self, fid, size):   # "ye file pehle se theek hai" - agle run me dobara probe nahi hoga (size badle to phir check)
+        try: self.svc.files().update(fileId=fid, body={'properties': {'prxOk': str(size)}}, supportsAllDrives=True, fields='id').execute()
+        except Exception as e: print('   (ok-marker nahi laga: %s)' % str(e)[:80])
 
     def mark_fail(self, fid, size):   # fail hui file har run me dobara na chale (file badlegi to size badlega, tab phir try)
         try: self.svc.files().update(fileId=fid, body={'properties': {'prxFail': str(size)}}, supportsAllDrives=True, fields='id').execute()
@@ -293,30 +359,59 @@ class Drive:
             revs = self.revisions(fid)
             if revs: self.svc.revisions().update(fileId=fid, revisionId=revs[-1]['id'], body={'keepForever': True}).execute()
         except Exception as e: print('   warning: original keepForever nahi hua:', str(e)[:120])
-        body = {'mimeType': 'video/mp4', 'properties': {'prxConv': '2', 'prxFail': None}}
+        body = {'mimeType': 'video/mp4', 'properties': {'prxConv': '2', 'prxSz': str(os.path.getsize(path)), 'prxFail': None, 'prxOk': None}}
         if new_name: body['name'] = new_name
         m = MediaFileUpload(path, mimetype='video/mp4', resumable=True, chunksize=128 * 1024 * 1024)
         r = self.svc.files().update(fileId=fid, body=body, media_body=m, supportsAllDrives=True, fields='id,size').execute(num_retries=5)
         if int(r.get('size', -1)) != os.path.getsize(path): raise RuntimeError('upload size mismatch')
 
 
+def is_done(f):
+    """Is file par kaam khatam hai (hamari conversion / pehle se theek / verify fail) aur file badli nahi (size wahi)."""
+    pr, sz = f.get('properties') or {}, str(f.get('size'))
+    return (pr.get('prxConv') == '2' and pr.get('prxSz') == sz) or pr.get('prxOk') == sz or pr.get('prxFail') == sz
+
+
+def plan_shards(folder_id, n, sa_json=None, exclude=None, only=None):
+    """Baaki (pending) files ko n jobs me size ke hisaab se BARABAR baanto (sabse badi file pehle, sabse khali job ko).
+    Return: list of [file ids] (len = min(n, pending)). Pending 0 ho to []."""
+    folder_id = extract_id(folder_id)
+    ex = [x.lower() for x in (exclude or []) if x]; only = [x.strip().lower() for x in (only or []) if x.strip()]
+    dr = Drive(sa_json); dr.folder_check(folder_id)
+    todo = []
+    for f in dr.walk(folder_id):
+        pl = f['path'].lower()
+        if ex and any(x in pl for x in ex): continue
+        if only and not any(x in pl for x in only): continue
+        if is_done(f): continue
+        todo.append(f)
+    if not todo: return []
+    k = max(1, min(int(n), len(todo)))
+    groups, load = [[] for _ in range(k)], [0] * k
+    for f in sorted(todo, key=lambda x: (-int(x.get('size') or 0), x['path'])):
+        i = load.index(min(load)); groups[i].append(f['id']); load[i] += max(int(f.get('size') or 0), 1)
+    print('Pending %d file -> %d job, load (MB): %s' % (len(todo), k, ', '.join('%.0f' % (x / 1048576) for x in load)))
+    return groups
+
+
 def fmt_mb(n): return '%.0f MB' % (int(n) / 1048576) if n else '?'
 
 
 def fix_one(src, info, plan, workdir):
-    """convert + verify. remux/audio fail ho to re-encode try karta hai. Dono fail = error (Drive untouched)."""
+    """convert + verify. Pehle normal, fail/atke to re-encode, phir SAFE mode (bina audio filter). Sab fail = error (Drive untouched)."""
     dst, last = os.path.join(workdir, 'out.mp4'), None
-    for pl in ([plan, 'transcode'] if plan != 'transcode' else ['transcode']):
+    tries = [(plan, False)] + ([('transcode', False)] if plan != 'transcode' else []) + [('transcode', True)]
+    for pl, safe in tries:
         try:
-            print('   %s...' % pl); convert(src, dst, pl, info)
+            print('   %s%s...' % (pl, ' (SAFE mode)' if safe else ''), flush=True); convert(src, dst, pl, info, safe=safe)
             return dst, verify(dst, info, src)
         except Exception as e:
-            last = e; print('   %s fail: %s' % (pl, str(e)[:200]))
+            last = e; print('   %s fail: %s' % (pl, str(e)[:200]), flush=True)
             if os.path.exists(dst): os.remove(dst)
     raise last
 
 
-def process_drive(folder_id, mode='plan', limit=None, workdir='/content/prx_work', sa_json=None, exclude=None, only=None, budget_min=300, shard=None):
+def process_drive(folder_id, mode='plan', limit=None, workdir='/content/prx_work', sa_json=None, exclude=None, only=None, budget_min=300, shard=None, assign=None):
     """mode: plan = sirf batao | test = convert+verify, Drive untouched | apply = replace | recover = purane version se wapas banao (only zaroori)"""
     for t in ('ffmpeg', 'ffprobe'):
         if not have(t): sys.exit(t + ' nahi mila.')
@@ -331,13 +426,18 @@ def process_drive(folder_id, mode='plan', limit=None, workdir='/content/prx_work
     ex = [x.lower() for x in (exclude or []) if x]
     n_fix = n_ok = n_err = 0; rows = []; t_all = time.time()
     print('Folder scan ho raha hai...\n')
-    idx = -1
+    idx = -1; n_skip = 0
     for f in sorted(dr.walk(folder_id), key=lambda x: x['path']):
         pl = f['path'].lower()
         if ex and any(x in pl for x in ex): continue
         if only and not any(x in pl for x in only): continue
+        if mode == 'recover' and f.get('properties', {}).get('prxConv') == '2' and not os.environ.get('PRX_FORCE_RECOVER'):
+            print('SKIP', f['path'], '| ye pehle hi recover/convert ho chuki hai (dobara karne se theek video kharab wale version se badal jayegi)'); continue
         idx += 1
-        if shard and idx % shard[1] != shard[0]: continue   # parallel job: har job apna hissa leta hai
+        if assign is not None:   # setup job ne size ke hisaab se baanta hua hissa diya hai
+            if f['id'] not in assign: continue
+        elif shard and idx % shard[1] != shard[0]: continue   # purana tarika: modulo
+        if mode == 'apply' and is_done(f) and (f.get('properties') or {}).get('prxFail') != str(f.get('size')): n_skip += 1; continue   # pehle hi ho chuki, probe bhi nahi
         if mode == 'apply' and f.get('properties', {}).get('prxFail') == str(f.get('size')):
             print('SKIP', f['path'], '| pehle verify fail hui thi (file badlegi tab dobara). Haath se: mode=test/recover'); continue
         if limit is not None and n_fix >= limit: print('limit pura (%d). Baaki baad me.' % limit); break
@@ -355,12 +455,17 @@ def process_drive(folder_id, mode='plan', limit=None, workdir='/content/prx_work
             else:
                 info = probe(dr.url(f['id']), dr.headers())
                 brand, mf, _ = mp4_layout(dr.reader(f['id'])); plan, desc = make_plan(info, brand, mf)
-                if plan == 'skip': print('OK', tag, '|', desc); n_ok += 1; continue
+                if plan == 'skip':
+                    print('OK', tag, '|', desc); n_ok += 1
+                    if mode == 'apply' and f.get('capabilities', {}).get('canEdit', True): dr.mark_ok(f['id'], f.get('size'))
+                    continue
                 print('>> ', tag, '|', desc, '=> %s' % plan.upper())
                 if mode == 'plan': n_fix += 1; continue
-                est = float(info['format'].get('duration') or 0) / 60 / (2 if plan == 'transcode' else 20)   # re-encode ~2x realtime maan ke
+                est = ref_dur(info) / 60 / (2 if plan == 'transcode' else 20)   # re-encode ~2x realtime maan ke
                 if mode == 'apply' and (time.time() - t_all) / 60 + est > budget_min: print('   time kam hai (~%.0f min chahiye), agle run me' % est); continue
                 if not f.get('capabilities', {}).get('canEdit', True) and mode != 'test': print('   SKIP: edit permission nahi'); n_err += 1; continue
+                free, need = shutil.disk_usage(workdir).free, int(f.get('size') or 0) * 4   # source + output (ultrafast bada banata hai) + slack
+                if need and free < need: print('   SKIP: disk kam (%.1f GB free, ~%.1f GB chahiye)' % (free / 1e9, need / 1e9)); rows.append((f['path'], 'SKIP', 'disk kam')); n_err += 1; continue
                 t0 = time.time(); print('   download...'); dr.download(f['id'], src)
                 dst, v = fix_one(src, info, plan, workdir)
             print('   verify ok:', v)
@@ -376,7 +481,7 @@ def process_drive(folder_id, mode='plan', limit=None, workdir='/content/prx_work
         finally:
             for p in (src, dst):
                 if os.path.exists(p): os.remove(p)
-    print('\nSummary: theek-pehle-se=%d, %s=%d, error=%d' % (n_ok, 'badli' if mode in ('apply', 'recover') else 'check/badalni', n_fix, n_err))
+    print('\nSummary: theek-pehle-se=%d, %s=%d, error=%d, pehle-se-done-skip=%d' % (n_ok, 'badli' if mode in ('apply', 'recover') else 'check/badalni', n_fix, n_err, n_skip))
     if rows and os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as o:
             o.write('## PrathamX Video Optimizer (%s)\n| File | Status | Detail |\n|---|---|---|\n' % mode + '\n'.join('| %s | %s | %s |' % r for r in rows) + '\n')
