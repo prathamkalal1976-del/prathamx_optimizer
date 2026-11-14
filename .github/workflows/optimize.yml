@@ -17,10 +17,15 @@ on:
         description: "Kitne videos (har job ke liye). test me khali = 1"
         required: false
       parallel:
-        description: "Kitne job ek saath (4 = 4 guna tez). test/recover me 1 rakho"
+        description: "Kitne job ek saath (apply me jitne zyada utna tez; kaam kam ho to khud kam job chalte hain). test/recover me 1"
         type: choice
-        options: ['1', '2', '4', '6']
+        options: ['1', '2', '4', '6', '8', '12', '16', '20']
         default: '1'
+      max_width:
+        description: "Video ki max chaudai (0 = jaisi hai waisi, 1280 = 720p tak, bahut tez agar source 1080p hai)"
+        type: choice
+        options: ['0', '1280', '960']
+        default: '0'
 
 concurrency:
   group: prx-optimize
@@ -29,19 +34,39 @@ concurrency:
 jobs:
   setup:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       n: ${{ steps.s.outputs.n }}
       shards: ${{ steps.s.outputs.shards }}
+      assign: ${{ steps.s.outputs.assign }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
       - id: s
         env:
           PAR: ${{ inputs.parallel || '4' }}
+          PRX_MODE: ${{ inputs.mode || 'apply' }}
+          PRX_ONLY: ${{ inputs.only }}
+          PRX_SA_JSON: ${{ secrets.PRX_SA_JSON }}
+          PRX_FOLDER_ID: ${{ secrets.PRX_FOLDER_ID }}
+          PRX_EXCLUDE: Feature plan,CA motivation
         run: |
-          echo "n=$PAR" >> "$GITHUB_OUTPUT"
-          echo "shards=[$(seq -s, 0 $((PAR-1)))]" >> "$GITHUB_OUTPUT"
+          # apply me: pehle Drive dekh ke baaki files size ke hisaab se barabar baanto (kuch baaki nahi = koi job nahi chalega)
+          if [ "$PRX_MODE" = "apply" ]; then
+            pip install -q -r requirements.txt && python prx_optimize_ci.py --plan "$PAR" || echo "plan fail -> purana tarika"
+          fi
+          if ! grep -q '^n=' "$GITHUB_OUTPUT" 2>/dev/null; then
+            echo "n=$PAR" >> "$GITHUB_OUTPUT"
+            echo "shards=[$(seq -s, 0 $((PAR-1)))]" >> "$GITHUB_OUTPUT"
+            echo "assign=" >> "$GITHUB_OUTPUT"
+          fi
 
   optimize:
     needs: setup
+    if: needs.setup.outputs.n != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
@@ -53,6 +78,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
       - name: Install ffmpeg + libs
         run: |
           sudo apt-get update -qq
@@ -67,6 +93,10 @@ jobs:
           PRX_ONLY: ${{ inputs.only }}
           PRX_LIMIT: ${{ inputs.limit }}
           PRX_SHARD: ${{ matrix.shard }}/${{ needs.setup.outputs.n }}
+          PRX_ASSIGN: ${{ needs.setup.outputs.assign }}
+          PRX_MAX_W: ${{ inputs.max_width || '0' }}
           PRX_PRESET: ultrafast
           PRX_CRF: '18'
+          PRX_STALL_MIN: '6'    # shuru hone ke baad itni der progress na badhe to ffmpeg band + safe mode me dobara
+          PRX_START_MIN: '10'   # shuru ka intezaar (badi file)
         run: python prx_optimize_ci.py
