@@ -112,10 +112,11 @@ def build_cmd(src, dst, plan, vinfo_w):
     elif plan == 'audio':
         c += ['-c:v', 'copy', '-tag:v', 'avc1', '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-af', 'aresample=async=1:first_pts=0']
     else:
-        c += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-profile:v', 'high',
-              '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-af', 'aresample=async=1:first_pts=0']
-        if vinfo_w and vinfo_w > 1280:
-            c += ['-vf', "scale='min(1280,iw)':-2"]
+        c += ['-c:v', 'libx264', '-preset', os.environ.get('PRX_PRESET', 'ultrafast'), '-crf', os.environ.get('PRX_CRF', '18'), '-pix_fmt', 'yuv420p', '-profile:v', 'high',
+              '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-af', 'aresample=async=1:first_pts=0']
+        mw = int(os.environ.get('PRX_MAX_W', '0') or 0)   # 0 = resolution bilkul wahi (koi chhota nahi)
+        if mw and vinfo_w and vinfo_w > mw:
+            c += ['-vf', "scale='min(%d,iw)':-2" % mw]
     c += ['-max_muxing_queue_size', '4096', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', dst]
     return c
 
@@ -315,7 +316,7 @@ def fix_one(src, info, plan, workdir):
     raise last
 
 
-def process_drive(folder_id, mode='plan', limit=None, workdir='/content/prx_work', sa_json=None, exclude=None, only=None, budget_min=300):
+def process_drive(folder_id, mode='plan', limit=None, workdir='/content/prx_work', sa_json=None, exclude=None, only=None, budget_min=300, shard=None):
     """mode: plan = sirf batao | test = convert+verify, Drive untouched | apply = replace | recover = purane version se wapas banao (only zaroori)"""
     for t in ('ffmpeg', 'ffprobe'):
         if not have(t): sys.exit(t + ' nahi mila.')
@@ -330,10 +331,13 @@ def process_drive(folder_id, mode='plan', limit=None, workdir='/content/prx_work
     ex = [x.lower() for x in (exclude or []) if x]
     n_fix = n_ok = n_err = 0; rows = []; t_all = time.time()
     print('Folder scan ho raha hai...\n')
-    for f in dr.walk(folder_id):
+    idx = -1
+    for f in sorted(dr.walk(folder_id), key=lambda x: x['path']):
         pl = f['path'].lower()
         if ex and any(x in pl for x in ex): continue
         if only and not any(x in pl for x in only): continue
+        idx += 1
+        if shard and idx % shard[1] != shard[0]: continue   # parallel job: har job apna hissa leta hai
         if mode == 'apply' and f.get('properties', {}).get('prxFail') == str(f.get('size')):
             print('SKIP', f['path'], '| pehle verify fail hui thi (file badlegi tab dobara). Haath se: mode=test/recover'); continue
         if limit is not None and n_fix >= limit: print('limit pura (%d). Baaki baad me.' % limit); break
