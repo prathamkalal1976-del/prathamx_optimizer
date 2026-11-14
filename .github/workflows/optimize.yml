@@ -14,17 +14,40 @@ on:
         description: "Sirf in naam wale (comma se alag). recover me ZAROORI"
         required: false
       limit:
-        description: "Kitne videos (test me khali = 1)"
+        description: "Kitne videos (har job ke liye). test me khali = 1"
         required: false
+      parallel:
+        description: "Kitne job ek saath (4 = 4 guna tez). test/recover me 1 rakho"
+        type: choice
+        options: ['1', '2', '4', '6']
+        default: '1'
 
 concurrency:
   group: prx-optimize
   cancel-in-progress: false
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      n: ${{ steps.s.outputs.n }}
+      shards: ${{ steps.s.outputs.shards }}
+    steps:
+      - id: s
+        env:
+          PAR: ${{ inputs.parallel || '4' }}
+        run: |
+          echo "n=$PAR" >> "$GITHUB_OUTPUT"
+          echo "shards=[$(seq -s, 0 $((PAR-1)))]" >> "$GITHUB_OUTPUT"
+
   optimize:
+    needs: setup
     runs-on: ubuntu-latest
     timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.setup.outputs.shards) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,4 +66,7 @@ jobs:
           PRX_MODE: ${{ inputs.mode || 'apply' }}
           PRX_ONLY: ${{ inputs.only }}
           PRX_LIMIT: ${{ inputs.limit }}
+          PRX_SHARD: ${{ matrix.shard }}/${{ needs.setup.outputs.n }}
+          PRX_PRESET: ultrafast
+          PRX_CRF: '18'
         run: python prx_optimize_ci.py
