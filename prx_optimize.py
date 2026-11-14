@@ -397,6 +397,45 @@ def plan_shards(folder_id, n, sa_json=None, exclude=None, only=None):
 def fmt_mb(n): return '%.0f MB' % (int(n) / 1048576) if n else '?'
 
 
+def check_source(src, info, samples=8):
+    """Source theek hai? Decode errors ya green frames ho to turant reject (lamba convert karne se pehle)."""
+    dur = ref_dur(info)
+    if not dur: raise RuntimeError('duration nahi mili')
+    for ss in (0, max(0.0, dur / 2 - 15)):   # shuru ke 30s + beech ke 30s decode karke dekho
+        r = run(['ffmpeg', '-v', 'error', '-ss', '%.1f' % ss, '-i', src, '-t', '30', '-an', '-f', 'null', '-'])
+        errs = [l for l in r.stderr.splitlines() if re.search(r'error|invalid|unavailable|corrupt|missing', l, re.I)]
+        if len(errs) > 5: raise RuntimeError('video kharab hai: %d decode errors @%.0fs (%s)' % (len(errs), ss, errs[0][:90]))
+    bad = 0
+    for k in range(samples):
+        b = frame(src, dur * (0.03 + 0.94 * k / (samples - 1)))
+        if b and green_frac(b) > 0.5: bad += 1
+    if bad > 2: raise RuntimeError('video me green frames hain (%d/%d)' % (bad, samples))
+
+
+def recover_pick(dr, f, revs, src, workdir):
+    """Purane versions me se theek wala dhundho: sabse PURANA (original) pehle, kharab hua to agla. PRX_REV=<number> se ek version zabardasti."""
+    forced = os.environ.get('PRX_REV', '').strip()
+    cands = [int(forced)] if forced.isdigit() and int(forced) < len(revs) else list(range(len(revs) - 1))   # abhi wala (latest) nahi
+    last = None
+    for i in cands:
+        r = revs[i]
+        print('   version %d try (%s, %s)...' % (i, str(r.get('modifiedTime', '?'))[:16], fmt_mb(r.get('size'))), flush=True)
+        try:
+            dr.download_rev(f['id'], r['id'], src)
+            info = probe(src); check_source(src, info)
+            brand, mf, _ = mp4_layout(local_reader(src)); plan, desc = make_plan(info, brand, mf)
+            if plan == 'skip': out = (src, desc)
+            else: out = fix_one(src, info, plan, workdir)
+            dr.keep(f['id'], r['id'])
+            print('   version %d theek mila' % i, flush=True)
+            return out
+        except Exception as e:
+            last = e; print('   version %d kaam ka nahi: %s' % (i, str(e)[:170]), flush=True)
+            for pth in (src, os.path.join(workdir, 'out.mp4')):
+                if os.path.exists(pth): os.remove(pth)
+    raise RuntimeError('koi purana version theek nahi mila (%s). Original lecture Drive me dobara upload karo.' % (str(last)[:110] if last else 'koi version nahi'))
+
+
 def fix_one(src, info, plan, workdir):
     """convert + verify. Pehle normal, fail/atke to re-encode, phir SAFE mode (bina audio filter). Sab fail = error (Drive untouched)."""
     dst, last = os.path.join(workdir, 'out.mp4'), None
@@ -408,6 +447,8 @@ def fix_one(src, info, plan, workdir):
         except Exception as e:
             last = e; print('   %s fail: %s' % (pl, str(e)[:200]), flush=True)
             if os.path.exists(dst): os.remove(dst)
+            if re.search(r'error while decoding|top block unavailable|Invalid data|Reference \d+ >=', str(e)):   # source hi kharab hai, dobara try bekaar
+                raise RuntimeError('source video kharab hai (decode errors): ' + str(e)[:120])
     raise last
 
 
@@ -447,11 +488,9 @@ def process_drive(folder_id, mode='plan', limit=None, workdir='/content/prx_work
             if mode == 'recover':
                 revs = dr.revisions(f['id'])
                 if len(revs) < 2: print('?  ', tag, '-> purana version nahi mila'); n_err += 1; continue
-                print('>> ', tag, '| RECOVER (purane version se)'); t0 = time.time()
-                dr.keep(f['id'], revs[-2]['id']); dr.download_rev(f['id'], revs[-2]['id'], src)
-                info = probe(src); brand, mf, _ = mp4_layout(local_reader(src)); plan, desc = make_plan(info, brand, mf)
-                if plan == 'skip': dst, v = src, desc
-                else: dst, v = fix_one(src, info, plan, workdir)
+                print('>> ', tag, '| RECOVER (purane version se) | versions:', ', '.join('%d=%s %s' % (i, str(r.get('modifiedTime', '?'))[:10], fmt_mb(r.get('size'))) for i, r in enumerate(revs)), flush=True)
+                t0 = time.time()
+                dst, v = recover_pick(dr, f, revs, src, workdir)
             else:
                 info = probe(dr.url(f['id']), dr.headers())
                 brand, mf, _ = mp4_layout(dr.reader(f['id'])); plan, desc = make_plan(info, brand, mf)
